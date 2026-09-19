@@ -304,7 +304,7 @@ def relocate(
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
     mask: Tensor,
-    binoms: Tensor,
+    binoms: Tensor | None = None,
     min_opacity: float = 0.005,
     scene: Scene | None = None,
 ):
@@ -313,7 +313,12 @@ def relocate(
     Args:
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
-        mask: A boolean mask to indicates which Gaussians are dead.
+        state: Extra per-Gaussian running state updated alongside the parameters.
+        mask: A boolean mask indicating which Gaussians are dead.
+        binoms: Deprecated compatibility argument. Relocation no longer needs a
+            precomputed Pascal table.
+        min_opacity: Lower clamp used by the relocation transform.
+        scene: Optional scene wrapper notified of the topology update.
     """
     # support "opacities" with shape [N,] or [N, 1]
     opacities = torch.sigmoid(params["opacities"])
@@ -324,26 +329,35 @@ def relocate(
 
     # Sample for new GSs
     probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
-    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
-    sampled_idxs = alive_indices[sampled_idxs]
+    sampled_local_idxs = _multinomial_sample(probs, n, replacement=True)
+    sampled_idxs = alive_indices[sampled_local_idxs]
+
+    # Multiple dead Gaussians can select the same live source. Relocation only
+    # depends on that source's total multiplicity, so evaluate Equation (9) once
+    # per unique source instead of repeating identical work for every sample.
+    # Count in the compact alive-index space instead of allocating an N-sized
+    # histogram over all (mostly dead) Gaussians.
+    sampled_counts = torch.bincount(sampled_local_idxs, minlength=len(alive_indices))
+    source_local_idxs = sampled_counts.nonzero(as_tuple=True)[0]
+    source_idxs = alive_indices[source_local_idxs]
     new_opacities, new_scales = compute_relocation(
-        opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
-        ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+        opacities=opacities[source_idxs],
+        scales=torch.exp(params["scales"])[source_idxs],
+        ratios=sampled_counts[source_local_idxs] + 1,
         binoms=binoms,
         min_opacity=min_opacity,
     )
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            p[sampled_idxs] = torch.logit(new_opacities)
+            p[source_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[source_idxs] = torch.log(new_scales)
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
-        v[sampled_idxs] = 0
+        v[source_idxs] = 0
         return v
 
     # update the parameters and the state in the optimizers
@@ -351,7 +365,7 @@ def relocate(
     # update the extra running state
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
-            v[sampled_idxs] = 0
+            v[source_idxs] = 0
     if scene is not None:
         scene.on_relocate(dead_indices, sampled_idxs)
 
@@ -362,27 +376,34 @@ def sample_add(
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
     n: int,
-    binoms: Tensor,
+    binoms: Tensor | None = None,
     min_opacity: float = 0.005,
     scene: Scene | None = None,
 ):
+    """Sample and append Gaussians while relocating each unique source once.
+
+    ``binoms`` is retained only for backwards compatibility; the relocation
+    kernel no longer consumes a precomputed Pascal table.
+    """
     opacities = torch.sigmoid(params["opacities"])
 
     probs = opacities.flatten()
     sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    sampled_counts = torch.bincount(sampled_idxs, minlength=len(opacities))
+    source_idxs = sampled_counts.nonzero(as_tuple=True)[0]
     new_opacities, new_scales = compute_relocation(
-        opacities=opacities[sampled_idxs],
-        scales=torch.exp(params["scales"])[sampled_idxs],
-        ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
+        opacities=opacities[source_idxs],
+        scales=torch.exp(params["scales"])[source_idxs],
+        ratios=sampled_counts[source_idxs] + 1,
         binoms=binoms,
         min_opacity=min_opacity,
     )
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            p[sampled_idxs] = torch.logit(new_opacities)
+            p[source_idxs] = torch.logit(new_opacities)
         elif name == "scales":
-            p[sampled_idxs] = torch.log(new_scales)
+            p[source_idxs] = torch.log(new_scales)
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 

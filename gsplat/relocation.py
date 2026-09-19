@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Tuple
 
 import torch
@@ -26,7 +25,7 @@ def compute_relocation(
     opacities: Tensor,  # [N]
     scales: Tensor,  # [N, 3]
     ratios: Tensor,  # [N]
-    binoms: Tensor,  # [n_max, n_max]
+    binoms: Tensor | None = None,
     min_opacity: float = 0.005,
 ) -> Tuple[Tensor, Tensor]:
     """Compute new Gaussians from a set of old Gaussians.
@@ -40,8 +39,8 @@ def compute_relocation(
         opacities: The opacities of the Gaussians. [N]
         scales: The scales of the Gaussians. [N, 3]
         ratios: The relative frequencies for each of the Gaussians. [N]
-        binoms: Precomputed lookup table for binomial coefficients used in
-          Equation 9 in the paper. [n_max, n_max]
+        binoms: Deprecated compatibility argument. The CUDA implementation no
+          longer needs a precomputed binomial table.
         min_opacity: Lower clamp applied to the new opacity before computing
           new scales. Defaults to 0.005.
 
@@ -53,14 +52,20 @@ def compute_relocation(
     """
 
     N = opacities.shape[0]
-    n_max, _ = binoms.shape
     assert scales.shape == (N, 3), scales.shape
     assert ratios.shape == (N,), ratios.shape
     opacities = opacities.contiguous()
     scales = scales.contiguous()
-    ratios.clamp_(min=1, max=n_max)
-    ratios = ratios.int().contiguous()
+    ratios = ratios.clamp_min(1).int().contiguous()
 
+    # Keep the legacy low-level custom-op signature for callers that invoke it
+    # directly, but the new kernel no longer reads the Pascal table.
+    if binoms is None:
+        binoms = torch.empty(0, device=opacities.device, dtype=opacities.dtype)
+        n_max = 0
+    else:
+        binoms = binoms.contiguous()
+        n_max = binoms.shape[0]
     new_opacities, new_scales = _make_lazy_cuda_func("relocation")(
         opacities, scales, ratios, binoms, n_max, min_opacity
     )

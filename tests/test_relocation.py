@@ -207,3 +207,213 @@ def test_relocate_many_duplicates_preserves_optimizer_state():
             assert torch.isfinite(moment).all()
             assert torch.all(moment[:-n_alive] != 0)
             assert torch.any(moment[-n_alive:] == 0)
+
+
+def _positive_integral_reference_relocation(
+    opacities: torch.Tensor,
+    scales: torch.Tensor,
+    ratios: torch.Tensor,
+    min_opacity: float,
+):
+    """Independent positive-integral reference for the collapsed Equation (9)."""
+    opacities = opacities.cpu()
+    scales = scales.cpu()
+    ratios = ratios.cpu().to(torch.int64)
+
+    new_opacities = torch.empty_like(opacities)
+    new_scales = torch.empty_like(scales)
+    eps = torch.finfo(opacities.dtype).eps
+    intervals = 1024
+    h = 8.0 / intervals
+
+    for idx in range(opacities.shape[0]):
+        n_idx = int(ratios[idx].item())
+        old_opacity = float(opacities[idx])
+        if n_idx <= 51:
+            new_opacity = 1.0 - (1.0 - old_opacity) ** (1.0 / n_idx)
+        else:
+            new_opacity = -math.expm1(math.log1p(-old_opacity) / n_idx)
+        new_opacity = min(max(new_opacity, min_opacity), 1.0 - eps)
+        new_opacities[idx] = new_opacity
+
+        simpson_sum = 0.0
+        for sample in range(intervals + 1):
+            x = sample * h
+            z = new_opacity * math.exp(-(x * x))
+            value = -math.expm1(n_idx * math.log1p(-z))
+            weight = (
+                1.0
+                if sample == 0 or sample == intervals
+                else (4.0 if sample % 2 else 2.0)
+            )
+            simpson_sum += weight * value
+        denom_sum = (2.0 / math.sqrt(math.pi)) * h * simpson_sum / 3.0
+        new_scales[idx] = scales[idx] * (old_opacity / denom_sum)
+
+    return new_opacities, new_scales
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="relocation is a CUDA op")
+def test_compute_relocation_supports_ratios_beyond_legacy_limit():
+    ratios = torch.tensor(
+        [52, 80, 128, 1024, 2048, 4096, 8192, 65536, 1_000_000],
+        device=device,
+        dtype=torch.float32,
+    )
+    opacities = torch.linspace(0.1, 0.8, len(ratios), device=device)
+    scales = torch.linspace(
+        0.2, 1.4, len(ratios) * 3, device=device, dtype=torch.float32
+    ).reshape(-1, 3)
+
+    new_opacities, new_scales = compute_relocation(
+        opacities, scales, ratios, min_opacity=0.005
+    )
+    ref_opacities, ref_scales = _positive_integral_reference_relocation(
+        opacities, scales, ratios, min_opacity=0.005
+    )
+
+    assert torch.isfinite(new_opacities).all()
+    assert torch.isfinite(new_scales).all()
+    torch.testing.assert_close(new_opacities.cpu(), ref_opacities, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(new_scales.cpu(), ref_scales, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="relocation is a CUDA op")
+def test_compute_relocation_does_not_clamp_ratio_to_legacy_table_size():
+    opacity = torch.tensor([0.9], device=device, dtype=torch.float32)
+    scale = torch.ones((1, 3), device=device, dtype=torch.float32)
+    ratio_80 = torch.tensor([80.0], device=device)
+    ratio_51 = torch.tensor([51.0], device=device)
+    legacy_binoms = _binomial_table(51, device)
+
+    opacity_80, _ = compute_relocation(
+        opacity, scale, ratio_80, legacy_binoms, min_opacity=0.0
+    )
+    opacity_51, _ = compute_relocation(
+        opacity, scale, ratio_51, legacy_binoms, min_opacity=0.0
+    )
+
+    expected_80 = -math.expm1(math.log1p(-float(opacity.item())) / 80.0)
+    torch.testing.assert_close(
+        opacity_80.cpu(),
+        torch.tensor([expected_80], dtype=torch.float32),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    assert not torch.allclose(opacity_80, opacity_51, rtol=1e-5, atol=1e-7)
+
+
+def _make_cpu_params(opacity_values: torch.Tensor) -> torch.nn.ParameterDict:
+    n = len(opacity_values)
+    return torch.nn.ParameterDict(
+        {
+            "means": torch.nn.Parameter(
+                torch.arange(n * 3, dtype=torch.float32).reshape(n, 3),
+                requires_grad=False,
+            ),
+            "scales": torch.nn.Parameter(
+                torch.zeros((n, 3), dtype=torch.float32), requires_grad=False
+            ),
+            "quats": torch.nn.Parameter(
+                torch.arange(n * 4, dtype=torch.float32).reshape(n, 4),
+                requires_grad=False,
+            ),
+            "opacities": torch.nn.Parameter(
+                torch.logit(opacity_values.clone()), requires_grad=False
+            ),
+        }
+    )
+
+
+def test_relocate_compacts_duplicate_sampled_sources(monkeypatch):
+    from gsplat.strategy import ops as gsplat_ops
+
+    params = _make_cpu_params(
+        torch.tensor([0.8, 0.6, 1e-3, 1e-3, 1e-3, 1e-3], dtype=torch.float32)
+    )
+    dead_mask = torch.tensor([False, False, True, True, True, True])
+    monkeypatch.setattr(
+        gsplat_ops,
+        "_multinomial_sample",
+        lambda weights, n, replacement=True: torch.tensor([0, 0, 1, 0]),
+    )
+
+    calls = {}
+
+    def fake_compute(opacities, scales, ratios, binoms=None, min_opacity=0.005):
+        calls["ratios"] = ratios.clone()
+        return (
+            torch.tensor([0.25, 0.4], dtype=opacities.dtype),
+            scales * torch.tensor([[0.5], [0.75]], dtype=scales.dtype),
+        )
+
+    monkeypatch.setattr(gsplat_ops, "compute_relocation", fake_compute)
+    original_means = params["means"].detach().clone()
+
+    gsplat_ops.relocate(params, {}, {}, dead_mask)
+
+    torch.testing.assert_close(calls["ratios"], torch.tensor([4, 2]))
+    updated_opacity = torch.sigmoid(params["opacities"])
+    torch.testing.assert_close(updated_opacity[:2], torch.tensor([0.25, 0.4]))
+    torch.testing.assert_close(
+        updated_opacity[2:], torch.tensor([0.25, 0.25, 0.4, 0.25])
+    )
+    torch.testing.assert_close(
+        params["means"][2:], original_means[torch.tensor([0, 0, 1, 0])]
+    )
+
+
+def test_sample_add_compacts_duplicate_sampled_sources(monkeypatch):
+    from gsplat.strategy import ops as gsplat_ops
+
+    params = _make_cpu_params(torch.tensor([0.8, 0.6], dtype=torch.float32))
+    monkeypatch.setattr(
+        gsplat_ops,
+        "_multinomial_sample",
+        lambda weights, n, replacement=True: torch.tensor([0, 0, 1, 0]),
+    )
+
+    calls = {}
+
+    def fake_compute(opacities, scales, ratios, binoms=None, min_opacity=0.005):
+        calls["ratios"] = ratios.clone()
+        return (
+            torch.tensor([0.25, 0.4], dtype=opacities.dtype),
+            scales * torch.tensor([[0.5], [0.75]], dtype=scales.dtype),
+        )
+
+    monkeypatch.setattr(gsplat_ops, "compute_relocation", fake_compute)
+    original_means = params["means"].detach().clone()
+
+    gsplat_ops.sample_add(params, {}, {}, n=4)
+
+    torch.testing.assert_close(calls["ratios"], torch.tensor([4, 2]))
+    assert len(params["means"]) == 6
+    torch.testing.assert_close(
+        params["means"][2:], original_means[torch.tensor([0, 0, 1, 0])]
+    )
+    updated_opacity = torch.sigmoid(params["opacities"])
+    torch.testing.assert_close(updated_opacity[:2], torch.tensor([0.25, 0.4]))
+    torch.testing.assert_close(
+        updated_opacity[2:], torch.tensor([0.25, 0.25, 0.4, 0.25])
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="relocation is a CUDA op")
+def test_compute_relocation_high_opacity_hybrid_matches_positive_reference():
+    ratios = torch.tensor([16, 41, 51, 80], device=device, dtype=torch.float32)
+    opacities = torch.full((len(ratios),), 0.999999, device=device)
+    scales = torch.linspace(
+        0.2, 1.1, len(ratios) * 3, device=device, dtype=torch.float32
+    ).reshape(-1, 3)
+
+    new_opacities, new_scales = compute_relocation(
+        opacities, scales, ratios, min_opacity=0.0
+    )
+    ref_opacities, ref_scales = _positive_integral_reference_relocation(
+        opacities, scales, ratios, min_opacity=0.0
+    )
+
+    assert torch.isfinite(new_scales).all()
+    torch.testing.assert_close(new_opacities.cpu(), ref_opacities, rtol=2e-6, atol=2e-7)
+    torch.testing.assert_close(new_scales.cpu(), ref_scales, rtol=2e-5, atol=2e-6)

@@ -21,6 +21,7 @@
 #if GSPLAT_BUILD_RELOC
 
 #    include <cfloat>
+#    include <cmath>
 
 #    include <ATen/Dispatch.h>
 #    include <ATen/core/Tensor.h>
@@ -38,8 +39,6 @@ __global__ void relocation_kernel(
     const scalar_t *opacities,
     const scalar_t *scales,
     const int *ratios,
-    const scalar_t *binoms,
-    int n_max,
     float min_opacity,
     scalar_t *new_opacities,
     scalar_t *new_scales
@@ -51,31 +50,73 @@ __global__ void relocation_kernel(
         return;
     }
 
-    int n_idx       = ratios[idx];
-    float denom_sum = 0.0f;
+    int n_idx = ratios[idx];
 
     // Clamp before the scale computation; intentionally deviates from the Eq. 9
     // transparency invariant for near-zero-opacity Gaussians for numerical
-    // stability purposes.
-    float new_opacity  = 1.0f - powf(1.0f - opacities[idx], 1.0f / n_idx);
+    // stability purposes. Preserve the legacy powf path over the old 1..51
+    // domain; use log1p/expm1 beyond it to avoid cancellation at large ratios.
+    float new_opacity  = n_idx <= 51 ? 1.0f - powf(1.0f - opacities[idx], 1.0f / static_cast<float>(n_idx))
+                                     : -expm1f(log1pf(-opacities[idx]) / static_cast<float>(n_idx));
     new_opacity        = fminf(fmaxf(new_opacity, min_opacity), 1.0f - FLT_EPSILON);
     new_opacities[idx] = new_opacity;
 
-    // compute new scale
-    for(int i = 1; i <= n_idx; ++i)
+    // Equation (9) contains a triangular double sum. Swap the summations and
+    // apply the hockey-stick identity:
+    //
+    //   sum_{i=1}^n sum_{k=0}^{i-1} C(i-1,k) (-1)^k p^(k+1)/sqrt(k+1)
+    // = sum_{j=1}^n C(n,j) (-1)^(j-1) p^j/sqrt(j).
+    //
+    // For well-conditioned cases, generate adjacent terms recursively with
+    // Kahan compensation. This is O(n), needs no Pascal table, and avoids the
+    // old n<=51 clamp.
+    float denom_sum;
+    const float np = static_cast<float>(n_idx) * new_opacity;
+    if(np <= 8.0f)
     {
-        for(int k = 0; k <= (i - 1); ++k)
+        float term       = np; // j = 1
+        denom_sum        = term;
+        float correction = 0.0f;
+        for(int j = 1; j < n_idx; ++j)
         {
-            float bin_coeff = binoms[(i - 1) * n_max + k];
-            // k is an integer, so compute the alternating sign exactly. Under
-            // -use_fast_math, pow(-1.0f, k) can be lowered to an approximation
-            // that returns NaN for negative bases on some GPU architectures.
-            float sign      = (k & 1) ? -1.0f : 1.0f;
-            float term      = (sign / sqrt(static_cast<float>(k + 1))) * pow(new_opacity, k + 1);
-            denom_sum      += (bin_coeff * term);
+            const float jp1  = static_cast<float>(j + 1);
+            term            *= -static_cast<float>(n_idx - j) / jp1 * new_opacity * sqrtf(static_cast<float>(j) / jp1);
+            const float corrected_term = term - correction;
+            const float next_sum       = denom_sum + corrected_term;
+            correction                 = (next_sum - denom_sum) - corrected_term;
+            denom_sum                  = next_sum;
         }
     }
-    float coeff = (opacities[idx] / denom_sum);
+    else
+    {
+        // Large n*p makes the alternating series ill-conditioned. Evaluate the
+        // equivalent positive integral instead:
+        //
+        //   2/sqrt(pi) * integral_0^inf [1-(1-p*exp(-x^2))^n] dx.
+        //
+        // A fixed 96-interval Simpson rule on [0,8] is sufficient here; its
+        // tail is negligible in float32. exp(-x^2) is advanced by recurrence,
+        // so each node needs only the stable log1p/expm1 pair.
+        constexpr int kIntervals      = 96;
+        constexpr float kExpRatio0    = 0.9930796124903161f; // exp(-1/144)
+        constexpr float kExpRatioStep = 0.9862071167439163f; // exp(-2/144)
+        constexpr float kSimpsonScale = 0.031343865752653126f;
+
+        float exp_x2      = 1.0f;
+        float exp_ratio   = kExpRatio0;
+        float simpson_sum = 0.0f;
+        for(int j = 0; j <= kIntervals; ++j)
+        {
+            const float z       = new_opacity * exp_x2;
+            const float value   = -expm1f(static_cast<float>(n_idx) * log1pf(-z));
+            const float weight  = (j == 0 || j == kIntervals) ? 1.0f : ((j & 1) ? 4.0f : 2.0f);
+            simpson_sum        += weight * value;
+            exp_x2             *= exp_ratio;
+            exp_ratio          *= kExpRatioStep;
+        }
+        denom_sum = kSimpsonScale * simpson_sum;
+    }
+    float coeff = opacities[idx] / denom_sum;
     for(int i = 0; i < 3; ++i)
     {
         new_scales[idx * 3 + i] = coeff * scales[idx * 3 + i];
@@ -87,14 +128,16 @@ void launch_relocation_kernel(
     at::Tensor opacities, // [N]
     at::Tensor scales,    // [N, 3]
     at::Tensor ratios,    // [N]
-    at::Tensor binoms,    // [n_max, n_max]
-    const int n_max,
+    at::Tensor binoms,    // legacy compatibility argument; unused
+    const int n_max,      // legacy compatibility argument; unused
     float min_opacity,
     // outputs
     at::Tensor new_opacities, // [N]
     at::Tensor new_scales     // [N, 3]
 )
 {
+    static_cast<void>(binoms);
+    static_cast<void>(n_max);
     uint32_t N = opacities.size(0);
 
     int64_t n_elements = N;
@@ -118,8 +161,6 @@ void launch_relocation_kernel(
                 opacities.const_data_ptr<scalar_t>(),
                 scales.const_data_ptr<scalar_t>(),
                 ratios.const_data_ptr<int>(),
-                binoms.const_data_ptr<scalar_t>(),
-                n_max,
                 min_opacity,
                 new_opacities.data_ptr<scalar_t>(),
                 new_scales.data_ptr<scalar_t>()
